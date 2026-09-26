@@ -11,13 +11,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
-/**
- * HTTP client for the Central Authority. Any network failure or timeout surfaces as
- * IOException so callers can treat "slow" and "down" the same way.
- */
+
 final class AuthorityClient {
     record Reply(int code, JsonObject body) {
-        /** Authority's current available count for the item, or -1 if the reply had none. */
         int available() {
             JsonElement v = body == null ? null : body.get("available");
             return v == null || v.isJsonNull() ? -1 : v.getAsInt();
@@ -46,7 +42,6 @@ final class AuthorityClient {
                 .build();
     }
 
-    /** reservationId is ours; the authority dedupes on it, which makes replays safe. */
     Reply reserve(String reservationId, String itemId, String userId, int qty) throws IOException {
         JsonObject body = new JsonObject();
         body.addProperty("reservationId", reservationId);

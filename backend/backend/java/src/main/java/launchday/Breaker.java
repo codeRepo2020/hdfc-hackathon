@@ -48,7 +48,6 @@ final class Breaker {
         return authorityUp;
     }
 
-    /** Called on any failed authority call, and by the poller on a failed probe. */
     void trip() {
         healthyStreak.set(0);
         authorityUp = false;
@@ -58,7 +57,6 @@ final class Breaker {
         }
     }
 
-    /** On startup, anything still queued means we must come up in stand-in and replay. */
     void start() throws Exception {
         int queued = db.tx(c -> Db.intOrNull(c, "SELECT COUNT(*) FROM standin_queue WHERE done_at IS NULL"));
         if (queued > 0 || !authority.healthy()) trip();
@@ -83,10 +81,6 @@ final class Breaker {
         }
     }
 
-    /**
-     * Replays the queue and switches to live once it is empty. Shared by the poller
-     * and POST /admin/reconcile; the lock keeps replays single-file and in order.
-     */
     ReplayStats recover() throws Exception {
         replayLock.lock();
         try {
@@ -138,7 +132,6 @@ final class Breaker {
 
     private record Queued(long seq, String reservationId, String itemId, String userId, int qty) {}
 
-    /** Replays queued reservations oldest first. Stops at the first network failure. */
     private ReplayStats drain() throws Exception {
         int replayed = 0, confirmed = 0, reversed = 0;
         while (true) {
@@ -178,7 +171,6 @@ final class Breaker {
 
             String finalReason = reason;
             db.tx(c -> {
-                // status only moves forward: pending -> confirmed | reversed
                 int moved = Db.exec(c, "UPDATE reservations SET status=? WHERE id=? AND status='pending'",
                         outcome, q.reservationId());
                 if (moved == 1 && finalReason != null) {

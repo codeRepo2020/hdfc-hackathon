@@ -80,14 +80,12 @@ final class Db {
         }
     }
 
-    /** Runs a statement for its side effect only (e.g. SELECT pg_advisory_xact_lock(...)). */
     static void run(Connection c, String sql, Object... args) throws SQLException {
         try (PreparedStatement ps = prepare(c, sql, args)) {
             ps.execute();
         }
     }
 
-    /** First column of the first row, or null when there is no row. */
     static Integer intOrNull(Connection c, String sql, Object... args) throws SQLException {
         try (PreparedStatement ps = prepare(c, sql, args); ResultSet rs = ps.executeQuery()) {
             return rs.next() ? rs.getInt(1) : null;

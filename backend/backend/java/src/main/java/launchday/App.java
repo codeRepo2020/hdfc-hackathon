@@ -30,13 +30,6 @@ import java.util.concurrent.Executors;
 /**
  * Reservation API (Java).
  *
- *  Part A — Idempotency: (userId, Idempotency-Key) is serialized with a Postgres
- *  advisory lock and mapped to exactly one reservation in idempotency_keys.
- *
- *  Part B — Stand-in: when the authority is slow/down the Breaker switches to
- *  stand-in mode; reservations are authorized against a shadow count per item,
- *  capped by STANDIN_MAX_PER_ITEM, queued durably in standin_queue and replayed
- *  in order once the authority is healthy again.
  */
 public class App {
     private static final Gson GSON = new Gson();
@@ -224,8 +217,6 @@ public class App {
                 "reversed", s.reversed(),
                 "mode", breaker.isLive() ? "live" : "standin"));
     }
-
-    // ---------------------------------------------------------------- POST /reservations
 
     /** What a reservation request resolved to. queued=true means it goes into standin_queue. */
     private record Outcome(String status, String mode, String reason, boolean queued) {
