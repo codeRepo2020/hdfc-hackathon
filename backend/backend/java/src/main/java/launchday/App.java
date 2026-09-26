@@ -33,7 +33,8 @@ import java.util.concurrent.Executors;
  *  Part A — Idempotency: (userId, Idempotency-Key) is serialized with a Postgres
  *  advisory lock and mapped to exactly one reservation in idempotency_keys.
  *
- *  Still broken: when the authority is slow or down, every request fails.
+ *  Breaker: when the authority is slow/down we stop calling it and fail fast
+ *  (503) until the health poller sees it healthy again. Still no stand-in.
  */
 public class App {
     private static final Gson GSON = new Gson();
@@ -56,10 +57,12 @@ public class App {
 
     private final Db db;
     private final AuthorityClient authority;
+    private final Breaker breaker;
 
-    App(Db db, AuthorityClient authority) {
+    App(Db db, AuthorityClient authority, Breaker breaker) {
         this.db = db;
         this.authority = authority;
+        this.breaker = breaker;
     }
 
     public static void main(String[] args) throws Exception {
@@ -75,8 +78,13 @@ public class App {
 
         AuthorityClient authority = new AuthorityClient(
                 env("AUTHORITY_URL", "http://127.0.0.1:9000").replaceAll("/$", ""),
-                Duration.ofMillis(Integer.parseInt(env("AUTHORITY_TIMEOUT_MS", "2000"))));
-        App app = new App(db, authority);
+                Duration.ofMillis(Integer.parseInt(env("AUTHORITY_TIMEOUT_MS", "2000"))),
+                Duration.ofMillis(Integer.parseInt(env("AUTHORITY_PROBE_TIMEOUT_MS", "800"))));
+        Breaker breaker = new Breaker(authority,
+                Integer.parseInt(env("AUTHORITY_BREAKER_POLL_MS", "1000")),
+                Integer.parseInt(env("AUTHORITY_BREAKER_HEALTHY_CHECKS", "3")));
+        App app = new App(db, authority, breaker);
+        breaker.start();
 
         int port = Integer.parseInt(env("PORT", "8080"));
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -87,17 +95,16 @@ public class App {
         // Default HttpServer handles one request at a time; give each request its own thread.
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
-        System.out.println("reservation api (java) :" + port);
+        System.out.println("reservation api (java) :" + port + " mode=" + (breaker.isLive() ? "live" : "standin"));
     }
 
     // ---------------------------------------------------------------- handlers
 
     private void health(HttpExchange ex) throws IOException {
-        // BUG: always reports live/healthy, even when the authority is gone.
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("status", "ok");
-        out.put("authority", "healthy");
-        out.put("mode", "live");
+        out.put("authority", breaker.authorityUp() ? "healthy" : "down");
+        out.put("mode", breaker.isLive() ? "live" : "standin");
         write(ex, 200, out);
     }
 
@@ -107,12 +114,16 @@ public class App {
             write(ex, 404, Map.of("error", "not_found"));
             return;
         }
-        try {
-            AuthorityClient.Reply r = authority.item(id);
-            write(ex, r.code(), r.body() == null ? Map.of() : r.body());
-        } catch (IOException e) {
-            write(ex, 502, Map.of("error", "authority_unreachable"));
+        if (breaker.isLive()) {
+            try {
+                AuthorityClient.Reply r = authority.item(id);
+                write(ex, r.code(), r.body() == null ? Map.of() : r.body());
+                return;
+            } catch (IOException e) {
+                breaker.trip();
+            }
         }
+        write(ex, 503, Map.of("error", "authority_unavailable"));
     }
 
     private void reservations(HttpExchange ex) throws Exception {
@@ -135,6 +146,7 @@ public class App {
             Db.exec(c, "DELETE FROM reservations");
             return null;
         });
+        breaker.resetMode();
         write(ex, 200, Map.of("status", "reset"));
     }
 
@@ -200,14 +212,21 @@ public class App {
             }
         }
 
+        // Breaker open: don't wait 2s on a timeout, fail fast.
+        // (Nothing has been written yet, so the transaction commits empty.)
+        if (!breaker.isLive()) return Map.of("error", "authority_unavailable");
+
         String rid = UUID.randomUUID().toString();
         AuthorityClient.Reply r;
         try {
             r = authority.reserve(rid, itemId, userId, qty);
         } catch (IOException e) {
-            // BUG (fixed later): authority slow or down means every reservation fails.
-            // Nothing has been written yet, so the transaction commits empty.
-            return Map.of("error", "authority_unreachable");
+            breaker.trip();
+            return Map.of("error", "authority_unavailable");
+        }
+        if (r.code() >= 500) {
+            breaker.trip();
+            return Map.of("error", "authority_unavailable");
         }
         String status = r.code() == 201 ? "confirmed" : "rejected";
         String reason = status.equals("rejected") ? r.str("reason") : null;
@@ -270,7 +289,7 @@ public class App {
     }
 
     private static int httpCode(Map<String, Object> result) {
-        if ("authority_unreachable".equals(result.get("error"))) return 502;
+        if ("authority_unavailable".equals(result.get("error"))) return 503;
         if (result.containsKey("error")) return 422;
         return switch (String.valueOf(result.get("status"))) {
             case "confirmed" -> 201;

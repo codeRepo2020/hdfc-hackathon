@@ -33,11 +33,13 @@ final class AuthorityClient {
 
     private final String base;
     private final Duration callTimeout;
+    private final Duration probeTimeout;
     private final HttpClient http;
 
-    AuthorityClient(String base, Duration callTimeout) {
+    AuthorityClient(String base, Duration callTimeout, Duration probeTimeout) {
         this.base = base;
         this.callTimeout = callTimeout;
+        this.probeTimeout = probeTimeout;
         this.http = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(callTimeout)
@@ -61,6 +63,16 @@ final class AuthorityClient {
     Reply item(String itemId) throws IOException {
         return send(HttpRequest.newBuilder(URI.create(base + "/items/" + itemId))
                 .timeout(callTimeout).GET().build());
+    }
+
+    /** Health probe with a short timeout, so "slow" counts as unhealthy. */
+    boolean healthy() {
+        try {
+            return send(HttpRequest.newBuilder(URI.create(base + "/health"))
+                    .timeout(probeTimeout).GET().build()).code() == 200;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     private Reply send(HttpRequest req) throws IOException {
