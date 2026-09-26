@@ -35,8 +35,8 @@ import java.util.concurrent.Executors;
  *
  *  Part B — Stand-in: when the authority is slow/down the Breaker switches to
  *  stand-in mode; reservations are authorized against a shadow count per item,
- *  capped by STANDIN_MAX_PER_ITEM, and queued durably in standin_queue.
- *  (Replaying the queue comes next; for now queued reservations stay pending.)
+ *  capped by STANDIN_MAX_PER_ITEM, queued durably in standin_queue and replayed
+ *  in order once the authority is healthy again.
  */
 public class App {
     private static final Gson GSON = new Gson();
@@ -100,7 +100,7 @@ public class App {
                 env("AUTHORITY_URL", "http://127.0.0.1:9000").replaceAll("/$", ""),
                 Duration.ofMillis(Integer.parseInt(env("AUTHORITY_TIMEOUT_MS", "2000"))),
                 Duration.ofMillis(Integer.parseInt(env("AUTHORITY_PROBE_TIMEOUT_MS", "800"))));
-        Breaker breaker = new Breaker(authority,
+        Breaker breaker = new Breaker(db, authority,
                 Integer.parseInt(env("AUTHORITY_BREAKER_POLL_MS", "1000")),
                 Integer.parseInt(env("AUTHORITY_BREAKER_HEALTHY_CHECKS", "3")));
         App app = new App(db, authority, breaker, Integer.parseInt(env("STANDIN_MAX_PER_ITEM", "10")));
@@ -112,6 +112,7 @@ public class App {
         server.createContext("/items", guard(app::items));
         server.createContext("/reservations", guard(app::reservations));
         server.createContext("/admin/reset", guard(app::reset));
+        server.createContext("/admin/reconcile", guard(app::reconcile));
         // Default HttpServer handles one request at a time; give each request its own thread.
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.start();
@@ -213,6 +214,15 @@ public class App {
             }
         }
         write(ex, 200, Map.of("status", "reset"));
+    }
+
+    private void reconcile(HttpExchange ex) throws Exception {
+        Breaker.ReplayStats s = breaker.recover();
+        write(ex, 200, Map.of(
+                "replayed", s.replayed(),
+                "confirmed", s.confirmed(),
+                "reversed", s.reversed(),
+                "mode", breaker.isLive() ? "live" : "standin"));
     }
 
     // ---------------------------------------------------------------- POST /reservations
@@ -327,9 +337,10 @@ public class App {
 
     /**
      * Authorize locally against the shadow count. Returns null if the breaker went
-     * back to live meanwhile (the caller then retries live).
+     * back to live before we got the gate (the caller then retries live).
      */
     private Outcome standIn(Connection c, String itemId, int qty) throws SQLException {
+        Db.run(c, Breaker.GATE_SHARED);
         if (breaker.isLive()) return null;
         // Row lock serializes all stand-in decisions for this item (I2, I5).
         Integer available = Db.intOrNull(c, "SELECT available FROM items WHERE id=? FOR UPDATE", itemId);
