@@ -33,8 +33,10 @@ import java.util.concurrent.Executors;
  *  Part A — Idempotency: (userId, Idempotency-Key) is serialized with a Postgres
  *  advisory lock and mapped to exactly one reservation in idempotency_keys.
  *
- *  Breaker: when the authority is slow/down we stop calling it and fail fast
- *  (503) until the health poller sees it healthy again. Still no stand-in.
+ *  Part B — Stand-in: when the authority is slow/down the Breaker switches to
+ *  stand-in mode; reservations are authorized against a shadow count per item,
+ *  capped by STANDIN_MAX_PER_ITEM, and queued durably in standin_queue.
+ *  (Replaying the queue comes next; for now queued reservations stay pending.)
  */
 public class App {
     private static final Gson GSON = new Gson();
@@ -53,6 +55,17 @@ public class App {
                 mode           TEXT NOT NULL,
                 reason         TEXT
             );
+            CREATE TABLE IF NOT EXISTS standin_queue (
+                seq            BIGSERIAL PRIMARY KEY,
+                reservation_id TEXT NOT NULL UNIQUE,
+                item_id        TEXT NOT NULL,
+                user_id        TEXT NOT NULL,
+                qty            INT NOT NULL,
+                enqueued_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                done_at        TIMESTAMPTZ,
+                outcome        TEXT
+            );
+            CREATE INDEX IF NOT EXISTS standin_queue_open_idx ON standin_queue (item_id) WHERE done_at IS NULL;
             """;
 
     private static final String SELECT_RESERVATION = """
@@ -63,11 +76,13 @@ public class App {
     private final Db db;
     private final AuthorityClient authority;
     private final Breaker breaker;
+    private final int standinMax;
 
-    App(Db db, AuthorityClient authority, Breaker breaker) {
+    App(Db db, AuthorityClient authority, Breaker breaker, int standinMax) {
         this.db = db;
         this.authority = authority;
         this.breaker = breaker;
+        this.standinMax = standinMax;
     }
 
     public static void main(String[] args) throws Exception {
@@ -88,7 +103,7 @@ public class App {
         Breaker breaker = new Breaker(authority,
                 Integer.parseInt(env("AUTHORITY_BREAKER_POLL_MS", "1000")),
                 Integer.parseInt(env("AUTHORITY_BREAKER_HEALTHY_CHECKS", "3")));
-        App app = new App(db, authority, breaker);
+        App app = new App(db, authority, breaker, Integer.parseInt(env("STANDIN_MAX_PER_ITEM", "10")));
         breaker.start();
 
         int port = Integer.parseInt(env("PORT", "8080"));
@@ -110,6 +125,10 @@ public class App {
         out.put("status", "ok");
         out.put("authority", breaker.authorityUp() ? "healthy" : "down");
         out.put("mode", breaker.isLive() ? "live" : "standin");
+        try {
+            out.put("queued", db.tx(c -> Db.intOrNull(c, "SELECT COUNT(*) FROM standin_queue WHERE done_at IS NULL")));
+        } catch (Exception ignored) {
+        }
         write(ex, 200, out);
     }
 
@@ -122,13 +141,33 @@ public class App {
         if (breaker.isLive()) {
             try {
                 AuthorityClient.Reply r = authority.item(id);
+                if (r.code() == 200 && r.available() >= 0) {
+                    db.tx(c -> {
+                        syncShadow(c, id, r.str("name"), r.available(), true);
+                        return null;
+                    });
+                }
                 write(ex, r.code(), r.body() == null ? Map.of() : r.body());
                 return;
             } catch (IOException e) {
                 breaker.trip();
             }
         }
-        write(ex, 503, Map.of("error", "authority_unavailable"));
+        // stand-in: answer from the shadow count
+        Map<String, Object> shadow = db.tx(c -> {
+            try (PreparedStatement ps = Db.prepare(c, "SELECT name, available FROM items WHERE id=?", id);
+                 ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("itemId", id);
+                m.put("name", rs.getString(1));
+                m.put("available", rs.getInt(2));
+                m.put("mode", "standin");
+                return m;
+            }
+        });
+        if (shadow == null) write(ex, 404, Map.of("error", "not_found"));
+        else write(ex, 200, shadow);
     }
 
     private void reservations(HttpExchange ex) throws Exception {
@@ -146,13 +185,33 @@ public class App {
     }
 
     private void reset(HttpExchange ex) throws Exception {
-        db.tx(c -> {
+        List<String> itemIds = db.tx(c -> {
             Db.exec(c, "DELETE FROM idempotency_keys");
+            Db.exec(c, "DELETE FROM standin_queue");
             Db.exec(c, "DELETE FROM reservation_meta");
             Db.exec(c, "DELETE FROM reservations");
-            return null;
+            List<String> ids = new ArrayList<>();
+            try (PreparedStatement ps = Db.prepare(c, "SELECT id FROM items"); ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) ids.add(rs.getString(1));
+            }
+            return ids;
         });
         breaker.resetMode();
+        // re-sync shadow counts from the (freshly reset) authority
+        for (String id : itemIds) {
+            try {
+                AuthorityClient.Reply r = authority.item(id);
+                if (r.code() == 200 && r.available() >= 0) {
+                    db.tx(c -> {
+                        syncShadow(c, id, r.str("name"), r.available(), true);
+                        return null;
+                    });
+                }
+            } catch (IOException e) {
+                breaker.trip();
+                break;
+            }
+        }
         write(ex, 200, Map.of("status", "reset"));
     }
 
@@ -226,15 +285,20 @@ public class App {
         }
 
         String rid = UUID.randomUUID().toString();
-        // Breaker open: don't wait 2s on a timeout, fail fast.
-        // (Nothing has been written yet, so the transaction commits empty.)
-        Outcome o = breaker.isLive() ? tryLive(c, rid, userId, itemId, qty) : null;
-        if (o == null) return Map.of("error", "authority_unavailable");
+        Outcome o = null;
+        while (o == null) {
+            if (breaker.isLive()) o = tryLive(c, rid, userId, itemId, qty);
+            if (o == null) o = standIn(c, itemId, qty); // null again = breaker flipped back to live, retry
+        }
 
         Db.exec(c, "INSERT INTO reservations (id, item_id, user_id, qty, status) VALUES (?,?,?,?,?)",
                 rid, itemId, userId, qty, o.status());
         Db.exec(c, "INSERT INTO reservation_meta (reservation_id, mode, reason) VALUES (?,?,?)",
                 rid, o.mode(), o.reason());
+        if (o.queued()) {
+            Db.exec(c, "INSERT INTO standin_queue (reservation_id, item_id, user_id, qty) VALUES (?,?,?,?)",
+                    rid, itemId, userId, qty);
+        }
         if (key != null) {
             Db.exec(c, "INSERT INTO idempotency_keys (user_id, idem_key, body_hash, reservation_id) VALUES (?,?,?,?)",
                     userId, key, hash, rid);
@@ -255,9 +319,45 @@ public class App {
             breaker.trip();
             return null;
         }
+        if (r.available() >= 0) syncShadow(c, itemId, null, r.available(), false);
         if (r.code() == 201) return new Outcome("confirmed", "live", null, false);
         String reason = r.str("reason") != null ? r.str("reason") : r.code() == 404 ? "unknown_item" : "authority_rejected";
         return Outcome.rejected("live", reason);
+    }
+
+    /**
+     * Authorize locally against the shadow count. Returns null if the breaker went
+     * back to live meanwhile (the caller then retries live).
+     */
+    private Outcome standIn(Connection c, String itemId, int qty) throws SQLException {
+        if (breaker.isLive()) return null;
+        // Row lock serializes all stand-in decisions for this item (I2, I5).
+        Integer available = Db.intOrNull(c, "SELECT available FROM items WHERE id=? FOR UPDATE", itemId);
+        if (available == null) {
+            // never synced from the authority: last known stock is effectively 0
+            return Outcome.rejected("standin", "insufficient_stock");
+        }
+        int queued = Db.intOrNull(c, "SELECT COUNT(*) FROM standin_queue WHERE item_id=? AND done_at IS NULL", itemId);
+        if (queued >= standinMax) return Outcome.rejected("standin", "standin_limit_reached");
+        if (available < qty) return Outcome.rejected("standin", "insufficient_stock");
+        Db.exec(c, "UPDATE items SET available = available - ? WHERE id=?", qty, itemId);
+        return new Outcome("pending", "standin", null, true);
+    }
+
+    /**
+     * Shadow = authority's count minus what we have promised locally but not yet replayed.
+     * absolute=false takes the minimum with the current value: concurrent reservation
+     * replies can arrive out of order, and during a drop stock only goes down.
+     */
+    static void syncShadow(Connection c, String itemId, String name, int authorityAvailable, boolean absolute)
+            throws SQLException {
+        int pending = Db.intOrNull(c,
+                "SELECT COALESCE(SUM(qty), 0) FROM reservations WHERE item_id=? AND status='pending'", itemId);
+        int shadow = Math.max(0, authorityAvailable - pending);
+        Db.exec(c, "INSERT INTO items (id, name, available) VALUES (?, ?, ?) "
+                        + "ON CONFLICT (id) DO UPDATE SET name = COALESCE(?, items.name), available = "
+                        + (absolute ? "EXCLUDED.available" : "LEAST(items.available, EXCLUDED.available)"),
+                itemId, name != null ? name : itemId, shadow, name);
     }
 
     // ---------------------------------------------------------------- reads
@@ -309,7 +409,6 @@ public class App {
     }
 
     private static int httpCode(Map<String, Object> result) {
-        if ("authority_unavailable".equals(result.get("error"))) return 503;
         if (result.containsKey("error")) return 422;
         return switch (String.valueOf(result.get("status"))) {
             case "confirmed" -> 201;
