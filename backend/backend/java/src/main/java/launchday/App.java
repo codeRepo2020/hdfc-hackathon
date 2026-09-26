@@ -12,12 +12,15 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,14 +28,26 @@ import java.util.UUID;
 import java.util.concurrent.Executors;
 
 /**
- * Reservation API (Java) — baseline: a thin pass-through to the Central Authority.
+ * Reservation API (Java).
  *
- * Same two launch-day bugs as the Go starter:
- *  1. Retries create a second reservation (no Idempotency-Key handling).
- *  2. When the authority is slow or down, every request fails.
+ *  Part A — Idempotency: (userId, Idempotency-Key) is serialized with a Postgres
+ *  advisory lock and mapped to exactly one reservation in idempotency_keys.
+ *
+ *  Still broken: when the authority is slow or down, every request fails.
  */
 public class App {
     private static final Gson GSON = new Gson();
+
+    private static final String SCHEMA = """
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                user_id        TEXT NOT NULL,
+                idem_key       TEXT NOT NULL,
+                body_hash      TEXT NOT NULL,
+                reservation_id TEXT NOT NULL,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (user_id, idem_key)
+            );
+            """;
 
     private static final String SELECT_RESERVATION = """
             SELECT r.id, r.item_id, r.user_id, r.qty, r.status
@@ -51,6 +66,12 @@ public class App {
         String[] conn = jdbc(env("DATABASE_URL", "jdbc:postgresql://localhost:5432/student"),
                 env("DATABASE_USER", "launchday"), env("DATABASE_PASSWORD", "launchday"));
         Db db = new Db(conn[0], conn[1], conn[2], Integer.parseInt(env("DB_POOL_SIZE", "30")));
+        db.tx(c -> {
+            try (Statement st = c.createStatement()) {
+                st.execute(SCHEMA);
+            }
+            return null;
+        });
 
         AuthorityClient authority = new AuthorityClient(
                 env("AUTHORITY_URL", "http://127.0.0.1:9000").replaceAll("/$", ""),
@@ -110,6 +131,7 @@ public class App {
 
     private void reset(HttpExchange ex) throws Exception {
         db.tx(c -> {
+            Db.exec(c, "DELETE FROM idempotency_keys");
             Db.exec(c, "DELETE FROM reservations");
             return null;
         });
@@ -139,26 +161,64 @@ public class App {
             return;
         }
         if (qty <= 0) qty = 1;
+        String key = ex.getRequestHeaders().getFirst("Idempotency-Key");
+        if (key != null && key.isBlank()) key = null;
 
-        // BUG: ignores Idempotency-Key and mints a new id every time, so a retry reserves twice.
+        String item = itemId, user = userId, idemKey = key;
+        int n = qty;
+        // userId is the key's scope, so only the rest of the body is fingerprinted
+        String hash = sha256(item + "\n" + n);
+        Map<String, Object> result = db.tx(c -> reserve(c, user, idemKey, hash, item, n));
+        write(ex, httpCode(result), result);
+    }
+
+    /**
+     * Runs inside one transaction. Returns the response body; an "error" key means 422.
+     */
+    private Map<String, Object> reserve(Connection c, String userId, String key, String hash,
+                                        String itemId, int qty) throws Exception {
+        if (key != null) {
+            // Serializes every request for this (user, key): concurrent replays wait here,
+            // then see the row the first one committed.
+            // length prefix keeps ("a:b","c") and ("a","b:c") from colliding
+            Db.run(c, "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", userId.length() + ":" + userId + ":" + key);
+            String existingHash = null, existingId = null;
+            try (PreparedStatement ps = Db.prepare(c,
+                    "SELECT body_hash, reservation_id FROM idempotency_keys WHERE user_id=? AND idem_key=?", userId, key);
+                 ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    existingHash = rs.getString(1);
+                    existingId = rs.getString(2);
+                }
+            }
+            if (existingId != null) {
+                if (!existingHash.equals(hash)) {
+                    return Map.of("error", "idempotency_key_reused",
+                            "message", "Idempotency-Key was already used with a different request body");
+                }
+                return loadReservation(c, existingId); // replay: same id, current status
+            }
+        }
+
         String rid = UUID.randomUUID().toString();
         AuthorityClient.Reply r;
         try {
             r = authority.reserve(rid, itemId, userId, qty);
         } catch (IOException e) {
-            // BUG: authority slow or down means every reservation fails.
-            write(ex, 502, Map.of("error", "authority_unreachable"));
-            return;
+            // BUG (fixed later): authority slow or down means every reservation fails.
+            // Nothing has been written yet, so the transaction commits empty.
+            return Map.of("error", "authority_unreachable");
         }
         String status = r.code() == 201 ? "confirmed" : "rejected";
         String reason = status.equals("rejected") ? r.str("reason") : null;
 
-        String item = itemId, user = userId;
-        int n = qty;
-        db.tx(c -> Db.exec(c, "INSERT INTO reservations (id, item_id, user_id, qty, status) VALUES (?,?,?,?,?)",
-                rid, item, user, n, status));
-        Map<String, Object> result = body(rid, itemId, userId, qty, status, "live", reason);
-        write(ex, httpCode(result), result);
+        Db.exec(c, "INSERT INTO reservations (id, item_id, user_id, qty, status) VALUES (?,?,?,?,?)",
+                rid, itemId, userId, qty, status);
+        if (key != null) {
+            Db.exec(c, "INSERT INTO idempotency_keys (user_id, idem_key, body_hash, reservation_id) VALUES (?,?,?,?)",
+                    userId, key, hash, rid);
+        }
+        return body(rid, itemId, userId, qty, status, "live", reason);
     }
 
     // ---------------------------------------------------------------- reads
@@ -210,6 +270,7 @@ public class App {
     }
 
     private static int httpCode(Map<String, Object> result) {
+        if ("authority_unreachable".equals(result.get("error"))) return 502;
         if (result.containsKey("error")) return 422;
         return switch (String.valueOf(result.get("status"))) {
             case "confirmed" -> 201;
@@ -262,6 +323,10 @@ public class App {
         if (o == null) return null;
         JsonElement v = o.get(key);
         return v == null || v.isJsonNull() || !v.isJsonPrimitive() ? null : v.getAsString();
+    }
+
+    private static String sha256(String s) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8)));
     }
 
     private static String query(HttpExchange ex, String key) {
