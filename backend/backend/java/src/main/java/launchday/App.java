@@ -48,11 +48,16 @@ public class App {
                 created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
                 PRIMARY KEY (user_id, idem_key)
             );
+            CREATE TABLE IF NOT EXISTS reservation_meta (
+                reservation_id TEXT PRIMARY KEY,
+                mode           TEXT NOT NULL,
+                reason         TEXT
+            );
             """;
 
     private static final String SELECT_RESERVATION = """
-            SELECT r.id, r.item_id, r.user_id, r.qty, r.status
-            FROM reservations r
+            SELECT r.id, r.item_id, r.user_id, r.qty, r.status, COALESCE(m.mode, 'live'), m.reason
+            FROM reservations r LEFT JOIN reservation_meta m ON m.reservation_id = r.id
             """;
 
     private final Db db;
@@ -143,6 +148,7 @@ public class App {
     private void reset(HttpExchange ex) throws Exception {
         db.tx(c -> {
             Db.exec(c, "DELETE FROM idempotency_keys");
+            Db.exec(c, "DELETE FROM reservation_meta");
             Db.exec(c, "DELETE FROM reservations");
             return null;
         });
@@ -151,6 +157,13 @@ public class App {
     }
 
     // ---------------------------------------------------------------- POST /reservations
+
+    /** What a reservation request resolved to. queued=true means it goes into standin_queue. */
+    private record Outcome(String status, String mode, String reason, boolean queued) {
+        static Outcome rejected(String mode, String reason) {
+            return new Outcome("rejected", mode, reason, false);
+        }
+    }
 
     private void postReserve(HttpExchange ex) throws Exception {
         JsonObject req;
@@ -212,32 +225,39 @@ public class App {
             }
         }
 
+        String rid = UUID.randomUUID().toString();
         // Breaker open: don't wait 2s on a timeout, fail fast.
         // (Nothing has been written yet, so the transaction commits empty.)
-        if (!breaker.isLive()) return Map.of("error", "authority_unavailable");
+        Outcome o = breaker.isLive() ? tryLive(c, rid, userId, itemId, qty) : null;
+        if (o == null) return Map.of("error", "authority_unavailable");
 
-        String rid = UUID.randomUUID().toString();
+        Db.exec(c, "INSERT INTO reservations (id, item_id, user_id, qty, status) VALUES (?,?,?,?,?)",
+                rid, itemId, userId, qty, o.status());
+        Db.exec(c, "INSERT INTO reservation_meta (reservation_id, mode, reason) VALUES (?,?,?)",
+                rid, o.mode(), o.reason());
+        if (key != null) {
+            Db.exec(c, "INSERT INTO idempotency_keys (user_id, idem_key, body_hash, reservation_id) VALUES (?,?,?,?)",
+                    userId, key, hash, rid);
+        }
+        return body(rid, itemId, userId, qty, o.status(), o.mode(), o.reason());
+    }
+
+    /** Pass-through to the authority. Returns null (after tripping the breaker) if it is slow or down. */
+    private Outcome tryLive(Connection c, String rid, String userId, String itemId, int qty) throws SQLException {
         AuthorityClient.Reply r;
         try {
             r = authority.reserve(rid, itemId, userId, qty);
         } catch (IOException e) {
             breaker.trip();
-            return Map.of("error", "authority_unavailable");
+            return null;
         }
         if (r.code() >= 500) {
             breaker.trip();
-            return Map.of("error", "authority_unavailable");
+            return null;
         }
-        String status = r.code() == 201 ? "confirmed" : "rejected";
-        String reason = status.equals("rejected") ? r.str("reason") : null;
-
-        Db.exec(c, "INSERT INTO reservations (id, item_id, user_id, qty, status) VALUES (?,?,?,?,?)",
-                rid, itemId, userId, qty, status);
-        if (key != null) {
-            Db.exec(c, "INSERT INTO idempotency_keys (user_id, idem_key, body_hash, reservation_id) VALUES (?,?,?,?)",
-                    userId, key, hash, rid);
-        }
-        return body(rid, itemId, userId, qty, status, "live", reason);
+        if (r.code() == 201) return new Outcome("confirmed", "live", null, false);
+        String reason = r.str("reason") != null ? r.str("reason") : r.code() == 404 ? "unknown_item" : "authority_rejected";
+        return Outcome.rejected("live", reason);
     }
 
     // ---------------------------------------------------------------- reads
@@ -272,7 +292,7 @@ public class App {
 
     private static Map<String, Object> row(ResultSet rs) throws SQLException {
         return body(rs.getString(1), rs.getString(2), rs.getString(3), rs.getInt(4),
-                rs.getString(5), "live", null);
+                rs.getString(5), rs.getString(6), rs.getString(7));
     }
 
     private static Map<String, Object> body(String id, String itemId, String userId, int qty,
